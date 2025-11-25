@@ -527,22 +527,24 @@ with tab_eda:
         # ============ HISTOGRAMAS ============
         st.markdown("#### Histogramas por variable")
 
-        col1, col2 = st.columns(2)
+        col1, col2, col3 = st.columns(3)
         
         with col1:
-            fig, axes = plt.subplots(1, 2, figsize=(6, 2.5))
-
-            axes[0].hist(df_plot["pop_total"].dropna(), bins=30)
-            axes[0].set_title("Población total", fontsize=10)
-
-            axes[1].hist(df_plot["pop_mexicana"].dropna(), bins=30)
-            axes[1].set_title("Población mexicana", fontsize=10)
-
+            fig, ax = plt.subplots(figsize=(4, 2.5))
+            ax.hist(df_plot["pop_total"].dropna(), bins=30)
+            ax.set_title("Población total", fontsize=10)
             plt.tight_layout()
             st.pyplot(fig)
         
         with col2:
-            fig, ax = plt.subplots(figsize=(3, 2.5))
+            fig, ax = plt.subplots(figsize=(4, 2.5))
+            ax.hist(df_plot["pop_mexicana"].dropna(), bins=30)
+            ax.set_title("Población mexicana", fontsize=10)
+            plt.tight_layout()
+            st.pyplot(fig)
+        
+        with col3:
+            fig, ax = plt.subplots(figsize=(4, 2.5))
             ax.hist(df_plot["pct_mexicana"].dropna(), bins=30)
             ax.set_title("% Población mexicana", fontsize=10)
             plt.tight_layout()
@@ -551,22 +553,24 @@ with tab_eda:
         # ============ BOXPLOTS ============
         st.markdown("#### Boxplots (detección de outliers)")
 
-        col1, col2 = st.columns(2)
+        col1, col2, col3 = st.columns(3)
         
         with col1:
-            fig, axes = plt.subplots(1, 2, figsize=(6, 2.5))
-
-            axes[0].boxplot(df_plot["ingreso_medio"].dropna())
-            axes[0].set_title("Ingreso medio", fontsize=10)
-
-            axes[1].boxplot(df_plot["pop_total"].dropna())
-            axes[1].set_title("Población total", fontsize=10)
-
+            fig, ax = plt.subplots(figsize=(4, 2.5))
+            ax.boxplot(df_plot["ingreso_medio"].dropna())
+            ax.set_title("Ingreso medio", fontsize=10)
             plt.tight_layout()
             st.pyplot(fig)
         
         with col2:
-            fig, ax = plt.subplots(figsize=(3, 2.5))
+            fig, ax = plt.subplots(figsize=(4, 2.5))
+            ax.boxplot(df_plot["pop_total"].dropna())
+            ax.set_title("Población total", fontsize=10)
+            plt.tight_layout()
+            st.pyplot(fig)
+        
+        with col3:
+            fig, ax = plt.subplots(figsize=(4, 2.5))
             ax.boxplot(df_plot["pct_mexicana"].dropna())
             ax.set_title("% mexicana", fontsize=10)
             plt.tight_layout()
@@ -1273,4 +1277,5 @@ with tab_geo:
     
     st.write(f"**{len(df_cluster)} ZIP codes** en este cluster")
     st.dataframe(df_cluster, use_container_width=True)
+
 
