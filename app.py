@@ -130,126 +130,139 @@ def load_geo_points():
 
     return gdf[["zip_code", "lat", "lon"]]
 
-# ====== CARGA Y TRANSFORMACIONES GLOBALES ======
-df = load_data()   # 1) cargamos solo una vez
+# ====== FUNCIÓN PARA PREPARAR Y LIMPIAR DATOS ======
+@st.cache_data
+def prepare_census_data():
+    """Carga, limpia y prepara los datos del Census"""
+    df = load_data()   # 1) cargamos solo una vez
 
-# 2) Renombrar columnas para que sean más legibles
-df = df.rename(columns={
-    "B03001_004E": "pop_mexicana",
-    "B01003_001E": "pop_total",
-    "B19013_001E": "ingreso_medio",
-    "zip code tabulation area": "zip_code"
-})
+    # 2) Renombrar columnas para que sean más legibles
+    df = df.rename(columns={
+        "B03001_004E": "pop_mexicana",
+        "B01003_001E": "pop_total",
+        "B19013_001E": "ingreso_medio",
+        "zip code tabulation area": "zip_code"
+    })
 
-# 3) Convertir a numérico
-for col in ["pop_mexicana", "pop_total", "ingreso_medio"]:
-    before_count = df[col].notna().sum()
-    df[col] = pd.to_numeric(df[col], errors="coerce")
-    after_count = df[col].notna().sum()
-    lost_records = before_count - after_count
-    if lost_records > 0:
-        logging.warning(f"Columna '{col}': {lost_records} registros convertidos a NaN durante conversión a numérico")
+    # 3) Convertir a numérico
+    for col in ["pop_mexicana", "pop_total", "ingreso_medio"]:
+        before_count = df[col].notna().sum()
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+        after_count = df[col].notna().sum()
+        lost_records = before_count - after_count
+        if lost_records > 0:
+            logging.warning(f"Columna '{col}': {lost_records} registros convertidos a NaN durante conversión a numérico")
 
-# 3b) Limpiar outliers del Census Bureau (códigos de error: valores negativos enormes)
-logging.info("=== LIMPIEZA DE OUTLIERS ===")
-before_clean = len(df)
+    # 3b) Limpiar outliers del Census Bureau (códigos de error: valores negativos enormes)
+    logging.info("=== LIMPIEZA DE OUTLIERS ===")
+    before_clean = len(df)
 
-# Eliminar negativos y valores del Census Bureau muy altos/bajos
-df = df[
-    (df["pop_mexicana"].isna() | (df["pop_mexicana"] >= 0)) &
-    (df["pop_total"].isna() | (df["pop_total"] >= 0)) &
-    (df["ingreso_medio"].isna() | ((df["ingreso_medio"] >= 1000) & (df["ingreso_medio"] <= 500000)))
-].copy()
+    # Eliminar negativos y valores del Census Bureau muy altos/bajos
+    df = df[
+        (df["pop_mexicana"].isna() | (df["pop_mexicana"] >= 0)) &
+        (df["pop_total"].isna() | (df["pop_total"] >= 0)) &
+        (df["ingreso_medio"].isna() | ((df["ingreso_medio"] >= 1000) & (df["ingreso_medio"] <= 500000)))
+    ].copy()
 
-after_clean = len(df)
-if before_clean > after_clean:
-    logging.warning(f"Limpieza outliers Census: {before_clean - after_clean} registros removidos")
+    after_clean = len(df)
+    if before_clean > after_clean:
+        logging.warning(f"Limpieza outliers Census: {before_clean - after_clean} registros removidos")
 
-# Remover registros donde población mexicana > población total (error lógico)
-before_logic = len(df)
-df = df[df["pop_mexicana"] <= df["pop_total"]].copy()
-after_logic = len(df)
-if before_logic > after_logic:
-    logging.warning(f"Limpieza lógica (pop_mexicana > pop_total): {before_logic - after_logic} registros removidos")
+    # Remover registros donde población mexicana > población total (error lógico)
+    before_logic = len(df)
+    df = df[df["pop_mexicana"] <= df["pop_total"]].copy()
+    after_logic = len(df)
+    if before_logic > after_logic:
+        logging.warning(f"Limpieza lógica (pop_mexicana > pop_total): {before_logic - after_logic} registros removidos")
 
-# 4) Crear porcentaje de población mexicana
-df["pct_mexicana"] = (df["pop_mexicana"] / df["pop_total"]).fillna(0) * 100
+    # 4) Crear porcentaje de población mexicana
+    df["pct_mexicana"] = (df["pop_mexicana"] / df["pop_total"]).fillna(0) * 100
+    
+    return df, before_clean, after_clean
 
-# ====== CARGA DE DIMENSIÓN DE ZIPs (CIUDAD / ESTADO) ======
-ZIP_DIM_PATH = "ZIP_Locale_Detail(ZIP_DETAIL).csv"
+# ====== FUNCIÓN PARA PREPARAR DATOS CON DIMENSIÓN DE ZIPs =====
+@st.cache_data
+def prepare_merged_data():
+    """Carga y prepara datos fusionados con dimensión de ZIPs"""
+    df, before_clean, after_clean = prepare_census_data()
+    
+    # ====== CARGA DE DIMENSIÓN DE ZIPs (CIUDAD / ESTADO) ======
+    ZIP_DIM_PATH = "ZIP_Locale_Detail(ZIP_DETAIL).csv"
 
-# 1) Leer CSV original
-zip_dim_raw = pd.read_csv(ZIP_DIM_PATH, sep=";", dtype=str)
+    # 1) Leer CSV original
+    zip_dim_raw = pd.read_csv(ZIP_DIM_PATH, sep=";", dtype=str)
 
-zip_dim_raw.columns = zip_dim_raw.columns.str.strip()
+    zip_dim_raw.columns = zip_dim_raw.columns.str.strip()
 
-# 2) Normalizar ZIP a 5 dígitos
-zip_dim_raw["zip_code"] = (
-    zip_dim_raw["DELIVERY ZIPCODE"]
-        .astype(str)
-        .str.zfill(5)
-)
+    # 2) Normalizar ZIP a 5 dígitos
+    zip_dim_raw["zip_code"] = (
+        zip_dim_raw["DELIVERY ZIPCODE"]
+            .astype(str)
+            .str.zfill(5)
+    )
 
-# 3) Agrupar "CALIFORNIA 1", "CALIFORNIA 2"... en sólo "CALIFORNIA"
-zip_dim_raw["state_group"] = (
-    zip_dim_raw["DISTRICT NAME"]
-        .str.replace(r"\s+\d+$", "", regex=True)
-        .str.strip()
-)
+    # 3) Agrupar "CALIFORNIA 1", "CALIFORNIA 2"... en sólo "CALIFORNIA"
+    zip_dim_raw["state_group"] = (
+        zip_dim_raw["DISTRICT NAME"]
+            .str.replace(r"\s+\d+$", "", regex=True)
+            .str.strip()
+    )
 
-# 4) Quedarse con columnas importantes
-zip_dim = (
-    zip_dim_raw[[
-        "zip_code",
-        "PHYSICAL CITY",
-        "PHYSICAL STATE",
-        "state_group"
-    ]]
-    .drop_duplicates(subset=["zip_code"])
-)
+    # 4) Quedarse con columnas importantes
+    zip_dim = (
+        zip_dim_raw[[
+            "zip_code",
+            "PHYSICAL CITY",
+            "PHYSICAL STATE",
+            "state_group"
+        ]]
+        .drop_duplicates(subset=["zip_code"])
+    )
 
-# ===== UNIÓN CON LA DIMENSIÓN DE ZIPs =====
+    # ===== UNIÓN CON LA DIMENSIÓN DE ZIPs =====
 
-# Aseguramos que zip_code tiene 5 dígitos en ambas bases
-df["zip_code"] = df["zip_code"].astype(str).str.zfill(5)
-zip_dim["zip_code"] = zip_dim["zip_code"].astype(str).str.zfill(5)
+    # Aseguramos que zip_code tiene 5 dígitos en ambas bases
+    df["zip_code"] = df["zip_code"].astype(str).str.zfill(5)
+    zip_dim["zip_code"] = zip_dim["zip_code"].astype(str).str.zfill(5)
 
-# Unimos por zip_code
-before_merge = len(df)
-df_merged = df.merge(zip_dim, on="zip_code", how="left")
-after_merge = len(df_merged)
+    # Unimos por zip_code
+    before_merge = len(df)
+    df_merged = df.merge(zip_dim, on="zip_code", how="left")
+    after_merge = len(df_merged)
 
-# Normalizamos nombres de ciudad/estado para usarlos en el modelo
-df_merged = df_merged.rename(columns={
-    "PHYSICAL CITY": "PHYSICAL_CITY",
-    "PHYSICAL STATE": "PHYSICAL_STATE",
-})
+    # Normalizamos nombres de ciudad/estado para usarlos en el modelo
+    df_merged = df_merged.rename(columns={
+        "PHYSICAL CITY": "PHYSICAL_CITY",
+        "PHYSICAL STATE": "PHYSICAL_STATE",
+    })
 
-unmatched = (df_merged[["PHYSICAL_CITY", "PHYSICAL_STATE"]].isna().any(axis=1)).sum()
-if unmatched > 0:
-    logging.warning(f"Merge con ZIP_DIM: {unmatched} registros sin información de ciudad/estado")
+    unmatched = (df_merged[["PHYSICAL_CITY", "PHYSICAL_STATE"]].isna().any(axis=1)).sum()
+    if unmatched > 0:
+        logging.warning(f"Merge con ZIP_DIM: {unmatched} registros sin información de ciudad/estado")
 
-# Limpieza adicional de outliers en df_merged
-before_outlier_clean = len(df_merged)
-df_merged = df_merged[
-    (df_merged["pop_mexicana"].isna() | (df_merged["pop_mexicana"] >= 0)) &
-    (df_merged["pop_total"].isna() | (df_merged["pop_total"] >= 0)) &
-    (df_merged["ingreso_medio"].isna() | ((df_merged["ingreso_medio"] >= 1000) & (df_merged["ingreso_medio"] <= 500000))) &
-    (df_merged["pop_mexicana"] <= df_merged["pop_total"])
-].copy()
-after_outlier_clean = len(df_merged)
-if before_outlier_clean > after_outlier_clean:
-    logging.warning(f"Limpieza de outliers en df_merged: {before_outlier_clean - after_outlier_clean} registros removidos")
+    # Limpieza adicional de outliers en df_merged
+    before_outlier_clean = len(df_merged)
+    df_merged = df_merged[
+        (df_merged["pop_mexicana"].isna() | (df_merged["pop_mexicana"] >= 0)) &
+        (df_merged["pop_total"].isna() | (df_merged["pop_total"] >= 0)) &
+        (df_merged["ingreso_medio"].isna() | ((df_merged["ingreso_medio"] >= 1000) & (df_merged["ingreso_medio"] <= 500000))) &
+        (df_merged["pop_mexicana"] <= df_merged["pop_total"])
+    ].copy()
+    after_outlier_clean = len(df_merged)
+    if before_outlier_clean > after_outlier_clean:
+        logging.warning(f"Limpieza de outliers en df_merged: {before_outlier_clean - after_outlier_clean} registros removidos")
 
-# df_merged ahora incluye:
-# - pop_mexicana
-# - pop_total
-# - ingreso_medio
-# - pct_mexicana
-# - zip_code
-# - PHYSICAL CITY (ciudad)
-# - PHYSICAL STATE (estado)
-# - state_group (agrupación limpia)
+    # df_merged ahora incluye:
+    # - pop_mexicana
+    # - pop_total
+    # - ingreso_medio
+    # - pct_mexicana
+    # - zip_code
+    # - PHYSICAL_CITY (ciudad)
+    # - PHYSICAL_STATE (estado)
+    # - state_group (agrupación limpia)
+    
+    return df_merged, before_outlier_clean, after_outlier_clean
 
 @st.cache_data
 def load_zip_dimension():
@@ -332,22 +345,6 @@ def run_kmeans_auto(df_input, features, k_range=range(2, 9)):
 st.title("Modelo Go-to-Market Geoespacial")
 st.write("Dashboard inicial - Proyecto de Ciencia de Datos")
 
-# Mostrar info de limpieza realizada
-if after_outlier_clean < before_outlier_clean:
-    with st.expander("ℹ️ Datos: Limpieza aplicada"):
-        st.info(
-            f"""
-**Limpieza de datos aplicada:**
-- ❌ Removidos **{before_outlier_clean - after_outlier_clean}** registros con outliers
-  - Valores negativos en población o ingreso
-  - Ingresos menores a $1,000 o mayores a $500,000
-  - Población mexicana mayor a población total
-  - Códigos de error del Census Bureau (-666,666,666)
-
-**Registros finales:** {after_outlier_clean:,} ZIP codes
-            """
-        )
-
 # ========= PESTAÑAS =========
 tab_intro, tab_eda, tab_model, tab_geo = st.tabs(
     ["Introducción", "EDA Descriptiva", "Modelo K-Means", "Mapa Geoespacial"]
@@ -367,6 +364,23 @@ with tab_intro:
         - Un mapa geoespacial con los resultados
         """
     )
+    
+    df_merged, before_outlier_clean, after_outlier_clean = prepare_merged_data()
+    
+    if after_outlier_clean < before_outlier_clean:
+        with st.expander("ℹ️ Datos: Limpieza aplicada"):
+            st.info(
+                f"""
+**Limpieza de datos aplicada:**
+- ❌ Removidos **{before_outlier_clean - after_outlier_clean}** registros con outliers
+  - Valores negativos en población o ingreso
+  - Ingresos menores a $1,000 o mayores a $500,000
+  - Población mexicana mayor a población total
+  - Códigos de error del Census Bureau (-666,666,666)
+
+**Registros finales:** {after_outlier_clean:,} ZIP codes
+                """
+            )
 
 # ========= TAB 2: EDA =========
 with tab_eda:
