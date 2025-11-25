@@ -1058,19 +1058,27 @@ with tab_geo:
         ],
     )
 
-    # Crear polígonos Voronoi coloreados por cluster
+    # Crear polígonos Voronoi coloreados por cluster (OPTIMIZADO)
     @st.cache_data
     def create_voronoi_polygons(df_data):
-        """Crea polígonos Voronoi para cada ZIP code"""
+        """Crea polígonos Voronoi para cada ZIP code (optimizado)"""
         coords = df_data[["lon", "lat"]].values
+        n_points = len(coords)
         
-        if len(coords) < 4:
+        if n_points < 4:
             return None
+        
+        # OPTIMIZACIÓN 1: Limitar puntos si hay demasiados
+        if n_points > 3000:
+            st.warning(f"⚠️ Dataset muy grande ({n_points} ZIP codes). Usando muestreo del 50% para Voronoi.")
+            sample_idx = np.random.choice(n_points, size=n_points//2, replace=False)
+            df_data = df_data.iloc[sample_idx].reset_index(drop=True)
+            coords = df_data[["lon", "lat"]].values
         
         try:
             vor = Voronoi(coords)
             
-            # Paleta de colores para clusters (8 colores distintos)
+            # Paleta de colores para clusters
             cluster_colors = {
                 0: [255, 0, 0, 150],        # Rojo
                 1: [0, 0, 255, 150],        # Azul
@@ -1082,12 +1090,34 @@ with tab_geo:
                 7: [128, 0, 128, 150],      # Púrpura
             }
             
+            # Definir bounds geográficos para recortar polígonos infinitos
+            lon_min, lon_max = coords[:, 0].min() - 1, coords[:, 0].max() + 1
+            lat_min, lat_max = coords[:, 1].min() - 1, coords[:, 1].max() + 1
+            
             features = []
             for idx, (zip_code, cluster) in enumerate(zip(df_data["zip_code"].values, df_data["cluster"].values)):
-                region = vor.regions[vor.point_region[idx]]
+                region_idx = vor.point_region[idx]
+                region = vor.regions[region_idx]
                 
-                if -1 not in region and len(region) > 0:
+                if -1 not in region and len(region) > 2:
                     vertices = vor.vertices[region]
+                    
+                    # OPTIMIZACIÓN 2: Recortar a bounds para evitar polígonos enormes
+                    vertices_clipped = []
+                    for v in vertices:
+                        v_clipped = [
+                            np.clip(v[0], lon_min, lon_max),
+                            np.clip(v[1], lat_min, lat_max)
+                        ]
+                        vertices_clipped.append(v_clipped)
+                    
+                    vertices = np.array(vertices_clipped)
+                    
+                    # OPTIMIZACIÓN 3: Simplificar: cada Nth vértice (reduce complejidad)
+                    if len(vertices) > 10:
+                        step = max(1, len(vertices) // 10)
+                        vertices = vertices[::step]
+                    
                     if len(vertices) > 2:
                         cluster_id = int(cluster) if cluster is not None else 0
                         color = cluster_colors.get(cluster_id % 8, [128, 128, 128, 150])
@@ -1101,7 +1131,7 @@ with tab_geo:
                             },
                             "geometry": {
                                 "type": "Polygon",
-                                "coordinates": [[[v[0], v[1]] for v in vertices] + [[vertices[0][0], vertices[0][1]]]]
+                                "coordinates": [[[float(v[0]), float(v[1])] for v in vertices] + [[float(vertices[0][0]), float(vertices[0][1])]]]
                             }
                         }
                         features.append(polygon)
