@@ -42,7 +42,10 @@ for file_key, file_path in REQUIRED_FILES.items():
         st.stop()
 
 # ===== CONFIGURACIÓN API CENSUS =====
-CENSUS_API_KEY = os.getenv("CENSUS_API_KEY") or "a185f4932d47ac5c7a92ba4187bf5b98b056994b"
+CENSUS_API_KEY = os.getenv("CENSUS_API_KEY")
+if not CENSUS_API_KEY:
+    st.error("❌ CENSUS_API_KEY environment variable no configurada. Por favor, configúralo en Streamlit Cloud Secrets.")
+    st.stop()
 CENSUS_YEAR = "2022"
 CENSUS_DATASET = "acs/acs5"
 
@@ -68,8 +71,16 @@ def fetch_census_data():
         "key": CENSUS_API_KEY
     }
 
-    # Hacemos la petición
-    response = requests.get(CENSUS_BASE_URL, params=params)
+    # Hacemos la petición (timeout de 30 segundos)
+    try:
+        response = requests.get(CENSUS_BASE_URL, params=params, timeout=30)
+        response.raise_for_status()
+    except requests.exceptions.Timeout:
+        st.error("❌ Timeout: La API del Census tardó demasiado en responder")
+        raise
+    except requests.exceptions.RequestException as e:
+        st.error(f"❌ Error en la solicitud HTTP: {e}")
+        raise
 
     # Intentamos parsear como JSON
     try:
@@ -1262,3 +1273,4 @@ with tab_geo:
     
     st.write(f"**{len(df_cluster)} ZIP codes** en este cluster")
     st.dataframe(df_cluster, use_container_width=True)
+
