@@ -12,25 +12,26 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import silhouette_score
 from shapely import wkb
 from scipy.spatial import Voronoi
+from shapely.geometry import Polygon, Point
 import json
 
 logging.basicConfig(level=logging.INFO)
 
 
 def _find_col(cols, candidates):
-    """Regresa el primer nombre de columna que exista en `cols`."""
+    """Returns the first column name that exists in `cols`."""
     for c in candidates:
         if c in cols:
             return c
     return None
 
-# IMPORTANTE: layout ancho
+# IMPORTANT: wide layout
 st.set_page_config(
-    page_title="Modelo Go-to-Market Geoespacial",
+    page_title="Geospatial Go-to-Market Model",
     layout="wide"
 )
 
-# ===== VALIDACIÓN DE ARCHIVOS REQUERIDOS =====
+# ===== REQUIRED FILES VALIDATION =====
 REQUIRED_FILES = {
     "GEO_PARQUET_PATH": "georef-united-states-of-america-zc-point.parquet",
     "ZIP_DIM_PATH": "ZIP_Locale_Detail(ZIP_DETAIL).csv"
@@ -38,81 +39,120 @@ REQUIRED_FILES = {
 
 for file_key, file_path in REQUIRED_FILES.items():
     if not os.path.exists(file_path):
-        st.error(f"❌ Archivo requerido no encontrado: {file_path}")
+        st.error(f"❌ Required file not found: {file_path}")
         st.stop()
 
-# ===== CONFIGURACIÓN API CENSUS =====
+# ===== CENSUS API CONFIGURATION =====
+
 CENSUS_API_KEY = os.getenv("CENSUS_API_KEY")
 if not CENSUS_API_KEY:
-    st.error("❌ CENSUS_API_KEY environment variable no configurada. Por favor, configúralo en Streamlit Cloud Secrets.")
+    st.error("❌ CENSUS_API_KEY environment variable not configured. Please configure it in Streamlit Cloud Secrets.")
     st.stop()
 CENSUS_YEAR = "2022"
 CENSUS_DATASET = "acs/acs5"
 
-CENSUS_VARS = [
+CENSUS_VARS_BASE = [
     "NAME",
-    "B03001_004E",  # Población mexicana
-    "B01003_001E",  # Población total
-    "B19013_001E"   # Ingreso medio del hogar
+    "B03001_004E",  # Mexican population
+    "B01003_001E",  # Total population
+    "B19013_001E"   # Median household income
 ]
+
+CENSUS_VARS_OPTIONAL = [
+    "B16001_002E",  # Spanish spoken at home
+    "B15002_001E"   # Educational attainment
+]
+
+CENSUS_VARS = CENSUS_VARS_BASE + CENSUS_VARS_OPTIONAL
+
+VARIABLE_LABELS = {
+    "pop_mexicana": "Mexican Population",
+    "pop_total": "Total Population",
+    "ingreso_medio": "Median Household Income",
+    "spanish_home": "Spanish Spoken at Home",
+    "education": "Educational Attainment"
+}
 
 CENSUS_BASE_URL = f"https://api.census.gov/data/{CENSUS_YEAR}/{CENSUS_DATASET}"
 
 # ===== FUNCIÓN PARA OBTENER DATOS DEL CENSUS =====
 def fetch_census_data():
     """
-    Llama a la API del U.S. Census (ACS 5-year) y regresa un DataFrame
-    con población mexicana, población total e ingreso medio por ZIP.
-    Además, muestra la respuesta cruda en caso de error para depurar.
+    Calls the U.S. Census API (ACS 5-year) and returns a DataFrame.
+    Tries with optional variables first, falls back to base variables if needed.
     """
+    census_vars_to_use = CENSUS_VARS
+    
     params = {
-        "get": ",".join(CENSUS_VARS),
+        "get": ",".join(census_vars_to_use),
         "for": "zip code tabulation area:*",
         "key": CENSUS_API_KEY
     }
 
-    # Hacemos la petición (timeout de 30 segundos)
     try:
-        response = requests.get(CENSUS_BASE_URL, params=params, timeout=30)
+        logging.info(f"Fetching Census data with {len(census_vars_to_use)} variables...")
+        response = requests.get(CENSUS_BASE_URL, params=params, timeout=60)
         response.raise_for_status()
-    except requests.exceptions.Timeout:
-        st.error("❌ Timeout: La API del Census tardó demasiado en responder")
-        raise
-    except requests.exceptions.RequestException as e:
-        st.error(f"❌ Error en la solicitud HTTP: {e}")
-        raise
-
-    # Intentamos parsear como JSON
-    try:
         data = response.json()
-    except Exception as e:
-        st.error(f"No se pudo interpretar la respuesta como JSON: {e}")
-        st.code(response.text[:500], language="text")
-        raise
+    except requests.exceptions.Timeout:
+        logging.warning("Timeout with full variable set, falling back to base variables...")
+        census_vars_to_use = CENSUS_VARS_BASE
+        params["get"] = ",".join(census_vars_to_use)
+        try:
+            response = requests.get(CENSUS_BASE_URL, params=params, timeout=60)
+            response.raise_for_status()
+            data = response.json()
+        except Exception as e:
+            st.error(f"❌ Census API error (even with base variables): {e}")
+            raise
+    except requests.exceptions.RequestException as e:
+        logging.warning(f"Request error: {e}, trying base variables...")
+        census_vars_to_use = CENSUS_VARS_BASE
+        params["get"] = ",".join(census_vars_to_use)
+        try:
+            response = requests.get(CENSUS_BASE_URL, params=params, timeout=60)
+            response.raise_for_status()
+            data = response.json()
+        except Exception as e:
+            st.error(f"❌ Census API error: {e}")
+            raise
 
-    # data[0] = encabezados, data[1:] = filas
-    header = data[0]
-    rows = data[1:]
-
-    df = pd.DataFrame(rows, columns=header)
-    return df
-
-# ===== FUNCIÓN PARA CARGAR DATOS =====
-@st.cache_data
-def load_data():
     try:
-        df = fetch_census_data()
+        if isinstance(data, dict) and "error" in data:
+            st.warning(f"Census API returned error: {data['error']}")
+            logging.warning(f"Census API error response: {data}")
+            census_vars_to_use = CENSUS_VARS_BASE
+            params["get"] = ",".join(census_vars_to_use)
+            response = requests.get(CENSUS_BASE_URL, params=params, timeout=60)
+            response.raise_for_status()
+            data = response.json()
+            
+        header = data[0]
+        rows = data[1:]
+        df = pd.DataFrame(rows, columns=header)
+        logging.info(f"Successfully fetched Census data with columns: {list(df.columns)}")
         return df
     except Exception as e:
-        st.error(f"Error al cargar datos del Census: {e}")
+        st.error(f"Could not parse Census response: {e}")
+        raise
+
+# ===== LOAD DATA FUNCTION =====
+@st.cache_data(show_spinner=False)
+def load_data():
+    try:
+        with st.spinner("⏳ Loading Census Bureau data (may take 1-2 minutes)..."):
+            df = fetch_census_data()
+        return df
+    except Exception as e:
+        st.error(f"Error loading Census data: {e}")
         return pd.DataFrame()
 
-# ===== FUNCIÓN PARA CARGAR PUNTOS GEO (PARQUET) =====
+# ===== LOAD GEO POINTS FUNCTION (PARQUET) =====
 @st.cache_data
 def load_geo_points():
     """
-    Carga el archivo Parquet con los puntos de ZIP codes (lat/lon)
-    Convierte WKB geometry a coordenadas lat/lon
+    Loads the Parquet file with ZIP code points (lat/lon)
+    Converts WKB geometry to lat/lon coordinates
     """
     GEO_PARQUET_PATH = "georef-united-states-of-america-zc-point.parquet"
 
@@ -141,28 +181,109 @@ def load_geo_points():
 
     return gdf[["zip_code", "lat", "lon"]]
 
+# ===== VORONOI POLYGON GENERATION =====
+def generate_voronoi_polygons(df_map):
+    """
+    Generates Voronoi polygons for ZIP codes and returns as GeoJSON features.
+    Only creates polygons within the continental US bounds to avoid edge artifacts.
+    """
+    if df_map.empty or len(df_map) < 3:
+        return []
+    
+    points = df_map[["lon", "lat"]].values
+    
+    try:
+        vor = Voronoi(points)
+    except Exception as e:
+        logging.error(f"Voronoi computation failed: {e}")
+        return []
+    
+    us_bounds = {
+        "min_lon": -125,
+        "max_lon": -66,
+        "min_lat": 24,
+        "max_lat": 50
+    }
+    
+    features = []
+    cluster_colors = {
+        0: [255, 0, 0, 180], 1: [0, 0, 255, 180], 2: [0, 255, 0, 180], 3: [255, 255, 0, 180],
+        4: [255, 0, 255, 180], 5: [0, 255, 255, 180], 6: [255, 165, 0, 180], 7: [128, 0, 128, 180]
+    }
+    
+    for i, region_idx in enumerate(vor.point_region):
+        region = vor.regions[region_idx]
+        
+        if len(region) < 3 or -1 in region:
+            continue
+        
+        vertices = vor.vertices[region]
+        
+        clipped_vertices = []
+        for v in vertices:
+            lon, lat = v
+            if (us_bounds["min_lon"] <= lon <= us_bounds["max_lon"] and
+                us_bounds["min_lat"] <= lat <= us_bounds["max_lat"]):
+                clipped_vertices.append([lon, lat])
+        
+        if len(clipped_vertices) >= 3:
+            try:
+                polygon = Polygon(clipped_vertices)
+                if polygon.is_valid:
+                    cluster = int(df_map.iloc[i].get("cluster", 0))
+                    color = cluster_colors.get(cluster, [128, 128, 128, 180])
+                    
+                    features.append({
+                        "type": "Feature",
+                        "geometry": {
+                            "type": "Polygon",
+                            "coordinates": [clipped_vertices]
+                        },
+                        "properties": {
+                            "zip_code": str(df_map.iloc[i].get("zip_code", "")),
+                            "cluster": str(cluster),
+                            "cluster_display": f"Cluster {cluster}",
+                            "color": color,
+                            "income": float(df_map.iloc[i].get("ingreso_medio", 0))
+                        }
+                    })
+            except Exception as e:
+                logging.debug(f"Polygon creation failed for region {i}: {e}")
+    
+    return features
+
 # ====== FUNCIÓN PARA PREPARAR Y LIMPIAR DATOS ======
-@st.cache_data
+@st.cache_data(show_spinner=False)
 def prepare_census_data():
-    """Carga, limpia y prepara los datos del Census"""
+    """Loads, cleans, and prepares Census data"""
     df = load_data()   # 1) cargamos solo una vez
 
     # 2) Renombrar columnas para que sean más legibles
-    df = df.rename(columns={
+    rename_map = {
         "B03001_004E": "pop_mexicana",
         "B01003_001E": "pop_total",
         "B19013_001E": "ingreso_medio",
+        "B16001_002E": "spanish_home",
+        "B15002_001E": "education",
         "zip code tabulation area": "zip_code"
-    })
+    }
+    # Only rename columns that exist
+    rename_map = {k: v for k, v in rename_map.items() if k in df.columns}
+    df = df.rename(columns=rename_map)
 
     # 3) Convertir a numérico
-    for col in ["pop_mexicana", "pop_total", "ingreso_medio"]:
-        before_count = df[col].notna().sum()
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-        after_count = df[col].notna().sum()
-        lost_records = before_count - after_count
-        if lost_records > 0:
-            logging.warning(f"Columna '{col}': {lost_records} registros convertidos a NaN durante conversión a numérico")
+    numeric_cols = ["pop_mexicana", "pop_total", "ingreso_medio", "spanish_home", "education"]
+    for col in numeric_cols:
+        if col in df.columns:
+            before_count = df[col].notna().sum()
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+            after_count = df[col].notna().sum()
+            lost_records = before_count - after_count
+            if lost_records > 0:
+                logging.warning(f"Columna '{col}': {lost_records} registros convertidos a NaN durante conversión a numérico")
+        else:
+            logging.info(f"Columna opcional '{col}' no disponible en los datos del Census")
+            df[col] = np.nan
 
     # 3b) Limpiar outliers del Census Bureau (códigos de error: valores negativos enormes)
     logging.info("=== LIMPIEZA DE OUTLIERS ===")
@@ -177,14 +298,14 @@ def prepare_census_data():
 
     after_clean = len(df)
     if before_clean > after_clean:
-        logging.warning(f"Limpieza outliers Census: {before_clean - after_clean} registros removidos")
+        logging.warning(f"Limpieza outliers Census: {before_clean - after_clean} records removed")
 
     # Remover registros donde población mexicana > población total (error lógico)
     before_logic = len(df)
     df = df[df["pop_mexicana"] <= df["pop_total"]].copy()
     after_logic = len(df)
     if before_logic > after_logic:
-        logging.warning(f"Limpieza lógica (pop_mexicana > pop_total): {before_logic - after_logic} registros removidos")
+        logging.warning(f"Logical cleanup (Mexican population > total population): {before_logic - after_logic} records removed")
 
     # 4) Crear porcentaje de población mexicana
     df["pct_mexicana"] = (df["pop_mexicana"] / df["pop_total"]).fillna(0) * 100
@@ -192,86 +313,77 @@ def prepare_census_data():
     return df, before_clean, after_clean
 
 # ====== FUNCIÓN PARA PREPARAR DATOS CON DIMENSIÓN DE ZIPs =====
-@st.cache_data
+@st.cache_data(show_spinner=False)
 def prepare_merged_data():
-    """Carga y prepara datos fusionados con dimensión de ZIPs"""
-    df, before_clean, after_clean = prepare_census_data()
-    
-    # ====== CARGA DE DIMENSIÓN DE ZIPs (CIUDAD / ESTADO) ======
-    ZIP_DIM_PATH = "ZIP_Locale_Detail(ZIP_DETAIL).csv"
+    """Loads and prepares merged data with ZIP dimension"""
+    with st.spinner("📊 Preparing and cleaning data (this may take 2-3 minutes)..."):
+        df, before_clean, after_clean = prepare_census_data()
+        
+        # ====== CARGA DE DIMENSIÓN DE ZIPs (CIUDAD / ESTADO) ======
+        ZIP_DIM_PATH = "ZIP_Locale_Detail(ZIP_DETAIL).csv"
 
-    # 1) Leer CSV original
-    zip_dim_raw = pd.read_csv(ZIP_DIM_PATH, sep=";", dtype=str)
+        # 1) Leer CSV original
+        zip_dim_raw = pd.read_csv(ZIP_DIM_PATH, sep=";", dtype=str)
 
-    zip_dim_raw.columns = zip_dim_raw.columns.str.strip()
+        zip_dim_raw.columns = zip_dim_raw.columns.str.strip()
 
-    # 2) Normalizar ZIP a 5 dígitos
-    zip_dim_raw["zip_code"] = (
-        zip_dim_raw["DELIVERY ZIPCODE"]
-            .astype(str)
-            .str.zfill(5)
-    )
+        # 2) Normalizar ZIP a 5 dígitos
+        zip_dim_raw["zip_code"] = (
+            zip_dim_raw["DELIVERY ZIPCODE"]
+                .astype(str)
+                .str.zfill(5)
+        )
 
-    # 3) Agrupar "CALIFORNIA 1", "CALIFORNIA 2"... en sólo "CALIFORNIA"
-    zip_dim_raw["state_group"] = (
-        zip_dim_raw["DISTRICT NAME"]
-            .str.replace(r"\s+\d+$", "", regex=True)
-            .str.strip()
-    )
+        # 3) Agrupar "CALIFORNIA 1", "CALIFORNIA 2"... en sólo "CALIFORNIA"
+        zip_dim_raw["state_group"] = (
+            zip_dim_raw["DISTRICT NAME"]
+                .str.replace(r"\s+\d+$", "", regex=True)
+                .str.strip()
+        )
 
-    # 4) Quedarse con columnas importantes
-    zip_dim = (
-        zip_dim_raw[[
-            "zip_code",
-            "PHYSICAL CITY",
-            "PHYSICAL STATE",
-            "state_group"
-        ]]
-        .drop_duplicates(subset=["zip_code"])
-    )
+        # 4) Quedarse con columnas importantes
+        zip_dim = (
+            zip_dim_raw[[
+                "zip_code",
+                "PHYSICAL CITY",
+                "PHYSICAL STATE",
+                "state_group"
+            ]]
+            .drop_duplicates(subset=["zip_code"])
+        )
 
-    # ===== UNIÓN CON LA DIMENSIÓN DE ZIPs =====
+        # ===== UNIÓN CON LA DIMENSIÓN DE ZIPs =====
 
-    # Aseguramos que zip_code tiene 5 dígitos en ambas bases
-    df["zip_code"] = df["zip_code"].astype(str).str.zfill(5)
-    zip_dim["zip_code"] = zip_dim["zip_code"].astype(str).str.zfill(5)
+        # Aseguramos que zip_code tiene 5 dígitos en ambas bases
+        df["zip_code"] = df["zip_code"].astype(str).str.zfill(5)
+        zip_dim["zip_code"] = zip_dim["zip_code"].astype(str).str.zfill(5)
 
-    # Unimos por zip_code
-    before_merge = len(df)
-    df_merged = df.merge(zip_dim, on="zip_code", how="left")
-    after_merge = len(df_merged)
+        # Unimos por zip_code
+        before_merge = len(df)
+        df_merged = df.merge(zip_dim, on="zip_code", how="left")
+        after_merge = len(df_merged)
 
-    # Normalizamos nombres de ciudad/estado para usarlos en el modelo
-    df_merged = df_merged.rename(columns={
-        "PHYSICAL CITY": "PHYSICAL_CITY",
-        "PHYSICAL STATE": "PHYSICAL_STATE",
-    })
+        # Normalizamos nombres de ciudad/estado para usarlos en el modelo
+        df_merged = df_merged.rename(columns={
+            "PHYSICAL CITY": "PHYSICAL_CITY",
+            "PHYSICAL STATE": "PHYSICAL_STATE",
+        })
 
-    unmatched = (df_merged[["PHYSICAL_CITY", "PHYSICAL_STATE"]].isna().any(axis=1)).sum()
-    if unmatched > 0:
-        logging.warning(f"Merge con ZIP_DIM: {unmatched} registros sin información de ciudad/estado")
+        unmatched = (df_merged[["PHYSICAL_CITY", "PHYSICAL_STATE"]].isna().any(axis=1)).sum()
+        if unmatched > 0:
+            logging.warning(f"Merge with ZIP_DIM: {unmatched} records without city/state information")
 
-    # Limpieza adicional de outliers en df_merged
-    before_outlier_clean = len(df_merged)
-    df_merged = df_merged[
-        (df_merged["pop_mexicana"].isna() | (df_merged["pop_mexicana"] >= 0)) &
-        (df_merged["pop_total"].isna() | (df_merged["pop_total"] >= 0)) &
-        (df_merged["ingreso_medio"].isna() | ((df_merged["ingreso_medio"] >= 1000) & (df_merged["ingreso_medio"] <= 500000))) &
-        (df_merged["pop_mexicana"] <= df_merged["pop_total"])
-    ].copy()
-    after_outlier_clean = len(df_merged)
-    if before_outlier_clean > after_outlier_clean:
-        logging.warning(f"Limpieza de outliers en df_merged: {before_outlier_clean - after_outlier_clean} registros removidos")
-
-    # df_merged ahora incluye:
-    # - pop_mexicana
-    # - pop_total
-    # - ingreso_medio
-    # - pct_mexicana
-    # - zip_code
-    # - PHYSICAL_CITY (ciudad)
-    # - PHYSICAL_STATE (estado)
-    # - state_group (agrupación limpia)
+        # Limpieza adicional de outliers en df_merged
+        before_outlier_clean = len(df_merged)
+        df_merged = df_merged[
+            (df_merged["pop_mexicana"].isna() | (df_merged["pop_mexicana"] >= 0)) &
+            (df_merged["pop_total"].isna() | (df_merged["pop_total"] >= 0)) &
+            (df_merged["ingreso_medio"].isna() | ((df_merged["ingreso_medio"] >= 1000) & (df_merged["ingreso_medio"] <= 500000))) &
+            (df_merged["pop_mexicana"] <= df_merged["pop_total"])
+        ].copy()
+        after_outlier_clean = len(df_merged)
+        if before_outlier_clean > after_outlier_clean:
+            logging.warning(f"Outlier cleanup en df_merged: {before_outlier_clean - after_outlier_clean} records removed")
     
     return df_merged, before_outlier_clean, after_outlier_clean
 
@@ -316,11 +428,11 @@ def load_zip_dimension():
 
 def run_kmeans_auto(df_input, features, k_range=range(2, 9)):
     """
-    Corre K-Means con diferentes k y selecciona el mejor usando Silhouette.
-    Regresa:
-      - df_clustered: df_input + columna 'cluster'
-      - best_k: número óptimo de clusters
-      - best_score: score de Silhouette
+    Runs K-Means with different k and selects the best using Silhouette.
+    Returns:
+      - df_clustered: df_input + column 'cluster'
+      - best_k: optimal number of clusters
+      - best_score: Silhouette score
     """
     df_model = df_input.dropna(subset=features).copy()
     if df_model.empty:
@@ -357,45 +469,51 @@ st.title("Modelo Go-to-Market Geoespacial")
 st.write("Dashboard inicial - Proyecto de Ciencia de Datos")
 
 # ========= PESTAÑAS =========
-tab_intro, tab_eda, tab_model, tab_geo = st.tabs(
-    ["Introducción", "EDA Descriptiva", "Modelo K-Means", "Mapa Geoespacial"]
+tab_intro, tab_eda, tab_model, tab_geo, tab_sku = st.tabs(
+    ["Introduction", "Descriptive EDA", "K-Means Model", "Geospatial Map", "SKU Strategy"]
 )
 
 # ========= TAB 1: INTRODUCCIÓN =========
 with tab_intro:
-    st.subheader("Bienvenido 👋")
+    st.subheader("Welcome 👋")
     st.write(
         """
-        Esta aplicación será el prototipo de un modelo de Go-to-Market
-        para el mercado mexicano en Estados Unidos.
+        This application will be the prototype of a Go-to-Market model
+        for the Mexican market in the United States.
 
-        En las otras pestañas verás:
-        - EDA descriptiva de zonas
-        - Un modelo de clustering (K-Means)
-        - Un mapa geoespacial con los resultados
+        In the other tabs you will see:
+        - Descriptive EDA of zones
+        - A clustering model (K-Means)
+        - A geospatial map with the results
         """
     )
     
-    df_merged, before_outlier_clean, after_outlier_clean = prepare_merged_data()
+    if "df_merged" not in st.session_state:
+        df_merged, before_outlier_clean, after_outlier_clean = prepare_merged_data()
+        st.session_state["df_merged"] = df_merged
+        st.session_state["outlier_clean_stats"] = (before_outlier_clean, after_outlier_clean)
+    else:
+        df_merged = st.session_state["df_merged"]
+        before_outlier_clean, after_outlier_clean = st.session_state.get("outlier_clean_stats", (0, 0))
     
     if after_outlier_clean < before_outlier_clean:
         with st.expander("ℹ️ Datos: Limpieza aplicada"):
             st.info(
                 f"""
-**Limpieza de datos aplicada:**
-- ❌ Removidos **{before_outlier_clean - after_outlier_clean}** registros con outliers
-  - Valores negativos en población o ingreso
-  - Ingresos menores a $1,000 o mayores a $500,000
-  - Población mexicana mayor a población total
-  - Códigos de error del Census Bureau (-666,666,666)
+**Data cleaning applied:**
+- ❌ Removed **{before_outlier_clean - after_outlier_clean}** records with outliers
+  - Negative values in population or income
+  - Incomes menores a $1,000 o mayores a $500,000
+  - Population mexicana mayor a población total
+  - Census Bureau error codes (-666,666,666)
 
-**Registros finales:** {after_outlier_clean:,} ZIP codes
+**Final records:** {after_outlier_clean:,} ZIP codes
                 """
             )
 
 # ========= TAB 2: EDA =========
 with tab_eda:
-    st.markdown("## Exploración Descriptiva del Dataset (EDA)")
+    st.markdown("## Descriptive Data Exploration (EDA)")
 
     # 1) Cargamos datos "crudos" desde la API
     df = load_data()
@@ -422,7 +540,7 @@ with tab_eda:
     # 6) Limpiar datos extremos para que las gráficas sean legibles
     df_clean = df.copy()
 
-    # Ingreso medio razonable: entre 0 y 250k
+    # Income medio razonable: entre 0 y 250k
     df_clean = df_clean[
         (df_clean["ingreso_medio"] >= 0) &
         (df_clean["ingreso_medio"] <= 250000)
@@ -439,9 +557,9 @@ with tab_eda:
 
     # ====== Filtros (siempre visibles a la izquierda) ======
     with col_filters:
-        st.markdown("### 🧩 Filtros")
+        st.markdown("### 🧩 Filters")
 
-        # Rango de ingreso medio según los datos limpios
+        # Range of median income according to clean data
         ing_min = float(df_clean["ingreso_medio"].min())
         ing_max = float(df_clean["ingreso_medio"].max())
 
@@ -532,21 +650,21 @@ with tab_eda:
         with col1:
             fig, ax = plt.subplots(figsize=(4, 2.5))
             ax.hist(df_plot["pop_total"].dropna(), bins=30)
-            ax.set_title("Población total", fontsize=10)
+            ax.set_title("Population total", fontsize=10)
             plt.tight_layout()
             st.pyplot(fig)
         
         with col2:
             fig, ax = plt.subplots(figsize=(4, 2.5))
             ax.hist(df_plot["pop_mexicana"].dropna(), bins=30)
-            ax.set_title("Población mexicana", fontsize=10)
+            ax.set_title("Population mexicana", fontsize=10)
             plt.tight_layout()
             st.pyplot(fig)
         
         with col3:
             fig, ax = plt.subplots(figsize=(4, 2.5))
             ax.hist(df_plot["pct_mexicana"].dropna(), bins=30)
-            ax.set_title("% Población mexicana", fontsize=10)
+            ax.set_title("% Population mexicana", fontsize=10)
             plt.tight_layout()
             st.pyplot(fig)
 
@@ -558,14 +676,14 @@ with tab_eda:
         with col1:
             fig, ax = plt.subplots(figsize=(4, 2.5))
             ax.boxplot(df_plot["ingreso_medio"].dropna())
-            ax.set_title("Ingreso medio", fontsize=10)
+            ax.set_title("Income medio", fontsize=10)
             plt.tight_layout()
             st.pyplot(fig)
         
         with col2:
             fig, ax = plt.subplots(figsize=(4, 2.5))
             ax.boxplot(df_plot["pop_total"].dropna())
-            ax.set_title("Población total", fontsize=10)
+            ax.set_title("Population total", fontsize=10)
             plt.tight_layout()
             st.pyplot(fig)
         
@@ -599,7 +717,7 @@ with tab_eda:
                     linewidths=0.5
                 )
 
-                ax.set_xlabel("Ingreso medio (USD)")
+                ax.set_xlabel("Income medio (USD)")
                 ax.set_ylabel("% población mexicana")
                 ax.set_title(
                     "Bubble chart: ingreso vs % mexicana\n"
@@ -668,7 +786,7 @@ with tab_eda:
                 """
             )
         else:
-            st.info("No hay datos disponibles para generar conclusiones con los filtros actuales.")
+            st.info("No data available para generar conclusiones con los filtros actuales.")
 
 # ========= TAB 3: MODELO =========
 from sklearn.preprocessing import StandardScaler
@@ -700,7 +818,7 @@ def run_kmeans_segmentacion(df_input, features):
     k_max = min(6, n - 1)     # como máximo 6 clusters y < n
     k_min = 2
     if k_max < k_min + 1:
-        # Muy pocos registros para hacer clustering razonable
+        # Too few records for reasonable clustering
         return None, None, {}, None, None
 
     k_values = list(range(k_min, k_max + 1))
@@ -775,22 +893,54 @@ def run_kmeans_manual(df_input, features, k_manual):
 
 
 with tab_model:
-    st.subheader("Modelo K-Means (segmentación de zonas)")
+    st.subheader("K-Means Model (Zone Segmentation)")
 
     # ================== PREPARACIÓN DE DATOS ==================
     # Aseguramos que exista el df_merged con ciudad/estado
-    if "df_merged" not in globals() or df_merged.empty:
-        st.error("No hay datos preparados para el modelo (df_merged está vacío).")
+    if "df_merged" not in st.session_state or st.session_state["df_merged"].empty:
+        st.error("No data prepared para el modelo (df_merged is empty).")
     else:
-        # Columnas que usaremos
-        features = ["pop_mexicana", "pop_total", "ingreso_medio", "pct_mexicana"]
+        df_merged = st.session_state["df_merged"]
+        # Available features for clustering - start with base mandatory features
+        mandatory_features = ["pop_mexicana", "pop_total", "ingreso_medio", "pct_mexicana"]
+        optional_features = ["spanish_home", "education"]
+        
+        available_features = [f for f in mandatory_features if f in df_merged.columns]
+        for f in optional_features:
+            if f in df_merged.columns:
+                available_features.append(f)
+        
+        if not available_features:
+            st.error("No features available for clustering")
+            st.stop()
 
-        # Nos quedamos solo con filas completas en estas columnas
-        df_model_base = df_merged.dropna(subset=features).copy()
+        # Dropna only on mandatory features to keep more data
+        mandatory_for_dropna = [f for f in mandatory_features if f in df_merged.columns]
+        df_model_base = df_merged.dropna(subset=mandatory_for_dropna).copy()
+        
+        if df_model_base.empty:
+            st.error("No data available after cleaning")
+            st.stop()
 
         # ================== FILTRO EN SIDEBAR ==================
         with st.sidebar:
-            st.markdown("### 🎯 Filtros para el modelo")
+            st.markdown("### 🎯 Model filters")
+
+            # Variable selection
+            st.markdown("#### Select variables for clustering")
+            default_features = ["pop_mexicana", "ingreso_medio", "spanish_home"]
+            features_selected = st.multiselect(
+                "Choose variables to use in K-Means:",
+                options=available_features,
+                default=[f for f in default_features if f in available_features],
+                format_func=lambda x: VARIABLE_LABELS.get(x, x)
+            )
+            
+            if not features_selected:
+                st.warning("⚠️ Please select at least one variable for clustering")
+                features = None
+            else:
+                features = features_selected
 
             # Filtro por estado
             states = (
@@ -803,7 +953,7 @@ with tab_model:
                     .tolist()
                 )
             )
-            state_selected = st.selectbox("Estado (PHYSICAL_STATE):", states, index=0)
+            state_selected = st.selectbox("State (PHYSICAL_STATE):", states, index=0)
 
             # Filtro por ciudad (dinámico según el estado)
             if state_selected != "Todos":
@@ -823,103 +973,144 @@ with tab_model:
                     .tolist()
                 )
             )
-            city_selected = st.selectbox("Ciudad (PHYSICAL_CITY):", cities, index=0)
+            city_selected = st.selectbox("City (PHYSICAL_CITY):", cities, index=0)
             
             # Selector de número de clusters
-            st.markdown("#### Número de clusters")
+            st.markdown("#### Number of clusters")
             k_manual = st.slider(
-                "Elige k (manual):",
+                "Choose k (manual):",
                 min_value=2,
                 max_value=8,
                 value=2,
                 help="Selecciona un valor para usar clustering manual"
             )
-            use_manual = st.checkbox("✋ Usar valor manual en lugar de automático (Silhouette)", value=False)
+            use_manual = st.checkbox("✋ Use manual value instead of automatic (Silhouette)", value=False)
 
-        # Filtramos por estado y ciudad (si aplica)
-        df_model_filtered = df_model_base.copy()
-        
-        if state_selected != "Todos":
-            df_model_filtered = df_model_filtered[
-                df_model_filtered["PHYSICAL_STATE"].astype(str) == str(state_selected)
-            ]
-        
-        if city_selected != "Todas":
-            df_model_filtered = df_model_filtered[
-                df_model_filtered["PHYSICAL_CITY"].astype(str) == str(city_selected)
-            ]
-
-        n_rows = len(df_model_filtered)
-
-        st.markdown("**Variables utilizadas en el modelo**")
-        st.write(features)
-        
-        filter_text = ""
-        if state_selected != "Todos":
-            filter_text += f" en {state_selected}"
-        if city_selected != "Todas":
-            filter_text += f", {city_selected}"
-        
-        st.write(f"Registros usados en el modelo (después de filtros{filter_text}): **{n_rows}**")
-
-        if n_rows < 10:
-            st.warning(
-                "El estado seleccionado tiene muy pocos ZIP codes para entrenar un modelo de clustering robusto. "
-                "Selecciona otro estado o usa 'Todos'."
-            )
+        if features is None or len(features) == 0:
+            st.error("Please select at least one variable for clustering")
         else:
-            # ================== ENTRENAMIENTO (CACHÉ) ==================
-            if use_manual and k_manual is not None:
-                with st.spinner(f"Entrenando modelo K-Means con k={k_manual}..."):
-                    df_km, centroids_df = run_kmeans_manual(df_model_filtered, features, k_manual)
-                best_k = k_manual
-                best_score = None
-                sil_scores = {}
+            # Remove features that are all NaN
+            features_with_data = [f for f in features if df_model_base[f].notna().sum() > 0]
+            if not features_with_data:
+                st.error("Selected features have no data. Please select different features.")
+                st.stop()
+            
+            if len(features_with_data) < len(features):
+                st.warning(f"Removed features with no data. Using: {[VARIABLE_LABELS.get(f, f) for f in features_with_data]}")
+                features = features_with_data
+            
+            # Filtramos por estado y ciudad (si aplica)
+            df_model_filtered = df_model_base[df_model_base[features].notna().all(axis=1)].copy()
+            
+            if state_selected != "Todos":
+                df_model_filtered = df_model_filtered[
+                    df_model_filtered["PHYSICAL_STATE"].astype(str) == str(state_selected)
+                ]
+            
+            if city_selected != "Todas":
+                df_model_filtered = df_model_filtered[
+                    df_model_filtered["PHYSICAL_CITY"].astype(str) == str(city_selected)
+                ]
+
+            n_rows = len(df_model_filtered)
+
+            st.markdown("**Variables used in the model**")
+            feature_labels = [VARIABLE_LABELS.get(f, f) for f in features]
+            st.write(feature_labels)
+            
+            filter_text = ""
+            if state_selected != "Todos":
+                filter_text += f" en {state_selected}"
+            if city_selected != "Todas":
+                filter_text += f", {city_selected}"
+            
+            st.write(f"Records used in the model (after filters{filter_text}): **{n_rows}**")
+
+            if n_rows < 10:
+                st.warning(
+                    "The selected state has too few ZIP codes to train a robust clustering model. "
+                    "Select another state or use 'Todos'."
+                )
             else:
-                with st.spinner("Entrenando modelo K-Means y calculando Silhouette..."):
-                    df_km, centroids_df, sil_scores, best_k, best_score = run_kmeans_segmentacion(
-                        df_model_filtered, features
-                    )
-
-            st.session_state["df_km"] = df_km
-
-            if df_km is None or best_k is None:
-                st.error("No fue posible encontrar una configuración de clusters válida.")
-            else:
-                # ================== RESULTADOS ==================
-
-                # Tabla de Silhouette por k (solo si se usó automático)
-                if sil_scores:
-                    st.markdown("### Selección automática del número de clusters (k - Silhouette Score)")
-                    sil_df = (
-                        pd.DataFrame(
-                            [{"k": k, "silhouette": score} for k, score in sil_scores.items()]
-                        )
-                        .sort_values("k")
-                        .reset_index(drop=True)
-                    )
-                    st.dataframe(sil_df, use_container_width=True)
-
-                    st.success(
-                        f"El número óptimo de clusters según el coeficiente de Silhouette es **k = {best_k}** "
-                        f"(score = {best_score:.3f})."
-                    )
+                # ================== ENTRENAMIENTO (CACHÉ) ==================
+                if use_manual and k_manual is not None:
+                    with st.spinner(f"Training K-Means model with k={k_manual}..."):
+                        df_km, centroids_df = run_kmeans_manual(df_model_filtered, features, k_manual)
+                    best_k = k_manual
+                    best_score = None
+                    sil_scores = {}
                 else:
-                    st.info(f"✅ Modelo entrenado con **k = {best_k}** clusters (selección manual).")
+                    with st.spinner("Training K-Means model and calculating Silhouette..."):
+                        df_km, centroids_df, sil_scores, best_k, best_score = run_kmeans_segmentacion(
+                            df_model_filtered, features
+                        )
+
+                st.session_state["df_km"] = df_km
+
+                if df_km is None or best_k is None:
+                    st.error("Could not find a valid cluster configuration.")
+                else:
+                    # ================== RESULTADOS ==================
+
+                    # Tabla de Silhouette por k (solo si se usó automático)
+                    if sil_scores:
+                        st.markdown("### Automatic selection of number of clusters (k - Silhouette Score)")
+                        sil_df = (
+                            pd.DataFrame(
+                                [{"k": k, "silhouette": score} for k, score in sil_scores.items()]
+                            )
+                            .sort_values("k")
+                            .reset_index(drop=True)
+                        )
+                        st.dataframe(sil_df, use_container_width=True)
+
+                        st.success(
+                            f"The optimal number of clusters according to the Silhouette coefficient is **k = {best_k}** "
+                            f"(score = {best_score:.3f})."
+                        )
+                    else:
+                        st.info(f"✅ Model trained with **k = {best_k}** clusters (manual selection).")
 
                 # Centroides
-                st.markdown("### Centroides de los clusters (en escala original)")
+                st.markdown("### Cluster centroids (in original scale)")
                 st.dataframe(centroids_df, use_container_width=True)
 
-                # Distribución de ZIP codes por cluster
-                st.markdown("### Distribución de ZIP codes por cluster")
+                # Cluster Summary with Spanish percentage
+                st.markdown("### Cluster Summary")
+                cluster_summary = []
+                for cluster_id in sorted(df_km["cluster"].unique()):
+                    cluster_data = df_km[df_km["cluster"] == cluster_id]
+                    
+                    summary_row = {
+                        "cluster": cluster_id,
+                        "ZIP codes": len(cluster_data),
+                        "Income medio": cluster_data["ingreso_medio"].mean(),
+                        "Income min": cluster_data["ingreso_medio"].min(),
+                        "Income max": cluster_data["ingreso_medio"].max(),
+                        "% Mexican": cluster_data["pct_mexicana"].mean(),
+                        "Ciudad principal": cluster_data["PHYSICAL_CITY"].mode()[0] if len(cluster_data["PHYSICAL_CITY"].mode()) > 0 else "N/A"
+                    }
+                    
+                    if "spanish_home" in cluster_data.columns and cluster_data["spanish_home"].notna().sum() > 0:
+                        total_households = cluster_data["pop_total"].sum()
+                        spanish_households = cluster_data["spanish_home"].sum()
+                        pct_spanish = (spanish_households / total_households * 100) if total_households > 0 else 0
+                        summary_row["% Spanish Home"] = pct_spanish
+                    
+                    cluster_summary.append(summary_row)
+                
+                summary_df = pd.DataFrame(cluster_summary)
+                st.dataframe(summary_df, use_container_width=True)
+
+                # Distribution of ZIP codes by cluster
+                st.markdown("### Distribution of ZIP codes by cluster")
                 cluster_counts = df_km["cluster"].value_counts().sort_index()
                 col_bar, _ = st.columns([2, 1])
                 with col_bar:
                     fig, ax = plt.subplots(figsize=(4, 2.5))
                     cluster_counts.plot(kind="bar", ax=ax, color="steelblue")
                     ax.set_xlabel("Cluster")
-                    ax.set_ylabel("Cantidad de ZIP codes")
+                    ax.set_ylabel("Number of ZIP codes")
                     ax.set_title("Distribución por cluster")
                     plt.tight_layout()
                     st.pyplot(fig)
@@ -932,7 +1123,7 @@ with tab_model:
                 st.dataframe(df_km[cols_show].head(30), use_container_width=True)
 
                 # ================== CONCLUSIONES AUTOMÁTICAS ==================
-                st.markdown("### 🧠 Conclusiones automáticas del modelo")
+                st.markdown("### 🧠 Automatic model conclusions")
 
                 if state_selected == "Todos" and city_selected == "Todas":
                     location_text = "todo Estados Unidos"
@@ -945,93 +1136,81 @@ with tab_model:
 
                 st.markdown(
                     f"""
-- Se identificaron **{best_k} clusters** de ZIP codes para {location_text}.
-- El dataset utilizado para este modelo contiene **{n_rows} ZIP codes** después de aplicar los filtros.
-- Los centroides muestran cómo varían la **población total**, la **población mexicana** y el **ingreso medio**
-  entre los distintos segmentos.
-- Los clusters con ingresos medios más altos son candidatos naturales para lanzar **SKUs premium**;
-  los de ingreso bajo, para **líneas de entrada** o formatos más pequeños.
-- Combinando esta segmentación con el análisis de mercado (ventas por ZIP / retailer) podrás decidir
-  en qué zonas enfocar los lanzamientos de nuevos productos.
+- Identified **{best_k} clusters** ZIP codes for {location_text}.
+- The dataset used for this model contains **{n_rows} ZIP codes** después de aplicar los filtros.
+- The centroids show how vary la **población total**, la **población mexicana** y el **ingreso medio**
+  among the different segments.
+- Clusters with higher median incomes son candidatos naturales para lanzar **SKUs premium**;
+  los de ingreso bajo, para **líneas de entrada** or smaller formats.
+- By combining this segmentation with market analysis (ventas por ZIP / retailer) podrás decidir
+  en qué zonas enfocar the launches of new products.
 """
                 )
 
 # ========= TAB 4: MAPA GEOESPACIAL =========
 
 with tab_geo:
-    st.markdown("## 🗺️ Mapa Geoespacial")
+    st.markdown("## 🗺️ Geospatial Map")
     st.write(
-        "Visualizamos los ZIP codes segmentados sobre un mapa tipo Uber, "
-        "usando PyDeck. Cada punto representa un ZIP code; el color indica el cluster."
+        "Visualizing ZIP codes segmented on an Uber-type map, "
+        "using PyDeck. Each point represents a ZIP code; the color indicates the cluster."
     )
 
     # Ruta del GeoParquet que descargaste
     GEO_PARQUET_PATH = "georef-united-states-of-america-zc-point.parquet"  # ajusta el nombre si es distinto
 
     @st.cache_data
-    def load_geo_points():
-        from shapely.wkb import loads as wkb_loads
-        
-        gdf = pd.read_parquet(GEO_PARQUET_PATH)
+    def load_geo_points_optimized():
+        """Loads GeoParquet with optimizations - reads only needed columns"""
+        try:
+            # Try to read just the columns we need
+            gdf = pd.read_parquet(
+                GEO_PARQUET_PATH,
+                columns=["zip_code", "geo_point_2d"] if "geo_point_2d" in pd.read_parquet(GEO_PARQUET_PATH, columns=[0]).columns else None
+            )
+        except:
+            gdf = pd.read_parquet(GEO_PARQUET_PATH)
 
         if "zip_code" not in gdf.columns:
-            st.error(
-                "El archivo GeoParquet no contiene la columna 'zip_code'. "
-                f"Columnas disponibles: {list(gdf.columns)}"
-            )
             return None
 
         gdf["zip_code"] = gdf["zip_code"].astype(str).str.zfill(5)
 
-        if "geo_point_2d" in gdf.columns:
-            coord_col = "geo_point_2d"
-        elif "Geo Point" in gdf.columns:
-            coord_col = "Geo Point"
-        else:
-            st.error(
-                "No se encontró la columna de coordenadas ('geo_point_2d' o 'Geo Point') "
-                f"en el GeoParquet. Columnas disponibles: {list(gdf.columns)}"
-            )
+        coord_col = "geo_point_2d" if "geo_point_2d" in gdf.columns else "Geo Point" if "Geo Point" in gdf.columns else None
+        
+        if coord_col is None:
             return None
 
-        lats = []
-        lons = []
-        for geom_data in gdf[coord_col]:
-            try:
-                point = wkb_loads(geom_data)
-                lats.append(point.y)
-                lons.append(point.x)
-            except Exception as e:
-                logging.warning(f"Failed to parse geometry: {e}")
-                lats.append(None)
-                lons.append(None)
-
-        gdf["lat"] = lats
-        gdf["lon"] = lons
+        # Faster geometry parsing
+        from shapely.wkb import loads as wkb_loads
+        gdf[["lat", "lon"]] = gdf[coord_col].apply(
+            lambda x: pd.Series([None, None]) if x is None else pd.Series(
+                [wkb_loads(x).y, wkb_loads(x).x] if hasattr(x, '__len__') else [None, None]
+            )
+        )
+        
         gdf = gdf.dropna(subset=["lat", "lon"])
-
         return gdf[["zip_code", "lat", "lon"]]
 
-    geo_df = load_geo_points()
-    if geo_df is None:
-        st.stop()
+    with st.spinner("⏳ Loading geographic data..."):
+        geo_df = load_geo_points_optimized()
+        if geo_df is None:
+            st.error("Could not load geographic data from GeoParquet")
+            st.stop()
 
     # -------- Dataset del modelo con clusters --------
     if "df_km" in st.session_state and st.session_state["df_km"] is not None:
         df_model = st.session_state["df_km"].copy()
+    elif "df_merged" in st.session_state:
+        df_model = st.session_state["df_merged"].copy()
     else:
-        try:
-            df_model = df_merged.copy()
-        except NameError:
-            st.error("No encontré el dataframe 'df_merged' en tu app. Ajusta el nombre aquí para usar el dataset correcto.")
-            st.stop()
-
-        st.info("💡 Tip: Ve a la pestaña 'Modelo K-Means' para entrenar un modelo y obtener clusters más precisos.")
+        st.error("No data prepared. Reload the page.")
+        st.stop()
 
     # Aseguramos formato 5 dígitos también aquí
     df_model["zip_code"] = df_model["zip_code"].astype(str).str.zfill(5)
 
-    # Si por alguna razón aún no tienes la columna 'cluster', creamos una de emergencia
+    # If for some reason you still do not have the column 'cluster', we create an emergency one
     if "cluster" not in df_model.columns:
         st.warning(
             "No encontré la columna 'cluster' en el dataset del modelo. "
@@ -1061,174 +1240,77 @@ with tab_geo:
     # Centro del mapa
     midpoint = (df_map["lat"].mean(), df_map["lon"].mean())
 
-    # Selector de visualización
-    viz_mode = st.radio(
-        "📊 Tipo de visualización:",
-        ["📍 Polígonos por cluster", "🔥 Mapa de calor (hexágonos)"],
-        horizontal=True
+    # Density control
+    st.markdown("#### Map visualization options")
+    density_percent = st.slider(
+        "Show % of ZIP codes (for performance):",
+        min_value=10,
+        max_value=100,
+        value=75,
+        step=10,
+        help="Reduce for faster loading on slower connections"
     )
+    
+    n_sample = max(100, int(len(df_map) * density_percent / 100))
+    if len(df_map) > n_sample:
+        df_map_viz = df_map.sample(n=n_sample, random_state=42)
+        st.info(f"📊 Showing {n_sample} of {len(df_map)} ZIP codes ({density_percent}%)")
+    else:
+        df_map_viz = df_map.copy()
 
-    # Capa de hexágonos (Mapa de calor)
-    hexagon_layer = pdk.Layer(
-        "HexagonLayer",
-        data=df_map,
-        get_position="[lon, lat]",
-        radius=8000,
-        elevation_scale=50,
-        elevation_range=[0, 3000],
-        pickable=True,
-        extruded=True,
-        colorRange=[
-            [0, 0, 255],       # Azul = Baja densidad
-            [0, 255, 0],       # Verde
-            [255, 255, 0],     # Amarillo
-            [255, 127, 0],     # Naranja
-            [255, 0, 0],       # Rojo = Alta densidad
-        ],
-    )
-
-    # Crear polígonos Voronoi coloreados por cluster (OPTIMIZADO)
-    @st.cache_data
-    def create_voronoi_polygons(df_data):
-        """Crea polígonos Voronoi para cada ZIP code (optimizado)"""
-        coords = df_data[["lon", "lat"]].values
-        n_points = len(coords)
+    try:
+        with st.spinner("🔄 Generating Voronoi map (may take 10-30 seconds)..."):
+            features = generate_voronoi_polygons(df_map_viz)
         
-        if n_points < 4:
-            return None
-        
-        # OPTIMIZACIÓN 1: Limitar puntos si hay demasiados
-        if n_points > 3000:
-            st.warning(f"⚠️ Dataset muy grande ({n_points} ZIP codes). Usando muestreo del 50% para Voronoi.")
-            sample_idx = np.random.choice(n_points, size=n_points//2, replace=False)
-            df_data = df_data.iloc[sample_idx].reset_index(drop=True)
-            coords = df_data[["lon", "lat"]].values
-        
-        try:
-            vor = Voronoi(coords)
-            
-            # Paleta de colores para clusters
-            cluster_colors = {
-                0: [255, 0, 0, 150],        # Rojo
-                1: [0, 0, 255, 150],        # Azul
-                2: [0, 255, 0, 150],        # Verde
-                3: [255, 255, 0, 150],      # Amarillo
-                4: [255, 0, 255, 150],      # Magenta
-                5: [0, 255, 255, 150],      # Cian
-                6: [255, 165, 0, 150],      # Naranja
-                7: [128, 0, 128, 150],      # Púrpura
-            }
-            
-            # Definir bounds geográficos para recortar polígonos infinitos
-            lon_min, lon_max = coords[:, 0].min() - 1, coords[:, 0].max() + 1
-            lat_min, lat_max = coords[:, 1].min() - 1, coords[:, 1].max() + 1
-            
-            features = []
-            for idx, (zip_code, cluster) in enumerate(zip(df_data["zip_code"].values, df_data["cluster"].values)):
-                region_idx = vor.point_region[idx]
-                region = vor.regions[region_idx]
-                
-                if -1 not in region and len(region) > 2:
-                    vertices = vor.vertices[region]
-                    
-                    # OPTIMIZACIÓN 2: Recortar a bounds para evitar polígonos enormes
-                    vertices_clipped = []
-                    for v in vertices:
-                        v_clipped = [
-                            np.clip(v[0], lon_min, lon_max),
-                            np.clip(v[1], lat_min, lat_max)
-                        ]
-                        vertices_clipped.append(v_clipped)
-                    
-                    vertices = np.array(vertices_clipped)
-                    
-                    # OPTIMIZACIÓN 3: Simplificar: cada Nth vértice (reduce complejidad)
-                    if len(vertices) > 10:
-                        step = max(1, len(vertices) // 10)
-                        vertices = vertices[::step]
-                    
-                    if len(vertices) > 2:
-                        cluster_id = int(cluster) if cluster is not None else 0
-                        color = cluster_colors.get(cluster_id % 8, [128, 128, 128, 150])
-                        
-                        polygon = {
-                            "type": "Feature",
-                            "properties": {
-                                "zip_code": str(zip_code),
-                                "cluster": cluster_id,
-                                "color": color
-                            },
-                            "geometry": {
-                                "type": "Polygon",
-                                "coordinates": [[[float(v[0]), float(v[1])] for v in vertices] + [[float(vertices[0][0]), float(vertices[0][1])]]]
-                            }
-                        }
-                        features.append(polygon)
-            
-            return {
+        if not features:
+            st.error("Could not generate Voronoi polygons. Try reducing the density percentage.")
+        else:
+            geojson_data = {
                 "type": "FeatureCollection",
                 "features": features
             }
-        except Exception as e:
-            st.warning(f"Error creando Voronoi: {e}")
-            return None
-    
-    voronoi_geojson = create_voronoi_polygons(df_map)
-    
-    if voronoi_geojson:
-        polygon_layer = pdk.Layer(
-            "GeoJsonLayer",
-            data=voronoi_geojson,
-            stroked=True,
-            filled=True,
-            line_width_min_pixels=1,
-            get_fill_color="properties.color",
-            get_line_color="[255, 255, 255, 100]",
-            pickable=True,
-        )
-    else:
-        st.error("No se pudo crear la visualización de polígonos")
-        st.stop()
+            
+            voronoi_layer = pdk.Layer(
+                "GeoJsonLayer",
+                data=geojson_data,
+                stroked=True,
+                filled=True,
+                line_width_min_pixels=1,
+                line_width_max_pixels=2,
+                get_fill_color="properties.color",
+                get_line_color=[255, 255, 255, 100],
+                pickable=True,
+            )
+            
+            deck = pdk.Deck(
+                layers=[voronoi_layer],
+                initial_view_state=pdk.ViewState(
+                    latitude=midpoint[0],
+                    longitude=midpoint[1],
+                    zoom=3,
+                    pitch=0,
+                ),
+                map_style="mapbox://styles/mapbox/dark-v10",
+                tooltip={
+                    "html": "{cluster_display}",
+                    "style": {"backgroundColor": "black", "color": "white", "font-size": "16px", "padding": "10px", "border-radius": "5px"},
+                },
+            )
+            
+            st.markdown("""
+                <style>
+                    .deckgl-widget { display: none !important; }
+                    div[data-testid="stPydeck"] .mapboxgl-ctrl-top-right { display: none !important; }
+                </style>
+            """, unsafe_allow_html=True)
 
-    # Seleccionar capa según modo
-    if viz_mode == "📍 Polígonos por cluster":
-        layers = [polygon_layer]
-        tooltip = {
-            "html": (
-                "<b>ZIP:</b> {zip_code}<br/>"
-                "<b>Cluster:</b> {cluster}"
-            ),
-            "style": {"backgroundColor": "black", "color": "white"},
-        }
-    else:  # Mapa de calor
-        layers = [hexagon_layer]
-        tooltip = {
-            "html": "<b>Hexágono de densidad</b><br/>Datos agregados de la zona",
-            "style": {"backgroundColor": "black", "color": "white"},
-        }
-
-    deck = pdk.Deck(
-        layers=layers,
-        initial_view_state=pdk.ViewState(
-            latitude=midpoint[0],
-            longitude=midpoint[1],
-            zoom=3,
-            pitch=40,
-        ),
-        map_style="mapbox://styles/mapbox/dark-v10",
-        tooltip=tooltip,
-    )
+            col1, col2 = st.columns([2, 1])
+            with col1:
+                st.pydeck_chart(deck, use_container_width=True)
     
-    st.markdown("""
-        <style>
-            .deckgl-widget { display: none !important; }
-            div[data-testid="stPydeck"] .mapboxgl-ctrl-top-right { display: none !important; }
-        </style>
-    """, unsafe_allow_html=True)
-
-    col1, col2 = st.columns([2, 1])
-    with col1:
-        st.pydeck_chart(deck, use_container_width=True)
+    except Exception as e:
+        st.error(f"Error rendering Voronoi map: {e}")
+        logging.error(f"Voronoi map error: {e}")
 
     # -------- Conclusiones rápidas --------
     st.markdown("### 🧠 Conclusiones automáticas del mapa")
@@ -1260,7 +1342,7 @@ with tab_geo:
             "PHYSICAL_CITY": lambda x: x.mode()[0] if len(x.mode()) > 0 else "N/A"
         }).round(0)
     )
-    cluster_stats.columns = ["ZIP codes", "Ingreso medio", "Ingreso mín", "Ingreso máx", "% Mexicana", "Ciudad principal"]
+    cluster_stats.columns = ["ZIP codes", "Income medio", "Income mín", "Income máx", "% Mexican", "Ciudad principal"]
     st.dataframe(cluster_stats, use_container_width=True)
     
     # Selector de cluster para ver detalles
@@ -1277,5 +1359,292 @@ with tab_geo:
     
     st.write(f"**{len(df_cluster)} ZIP codes** en este cluster")
     st.dataframe(df_cluster, use_container_width=True)
+
+# ========= TAB 5: ESTRATEGIA SKU =========
+
+with tab_sku:
+    st.markdown("## 🛍️ SKU Strategy Integrated with K-Means")
+    st.write("SKU Tiers analysis crossed with K-Means Clusters for optimized launch strategy.")
+    
+    if "df_km" in st.session_state and st.session_state["df_km"] is not None:
+        df_sku_base = st.session_state["df_km"].copy()
+    elif "df_merged" in st.session_state:
+        df_sku_base = st.session_state["df_merged"].copy()
+    else:
+        df_sku_base = prepare_merged_data()[0]
+    
+    if df_sku_base.empty:
+        st.error("No data available")
+        st.stop()
+    
+    # Clasificación SKU (vectorizada)
+    df_sku_base["sku_tier"] = "Value"
+    df_sku_base.loc[(df_sku_base["ingreso_medio"] >= 40000) & (df_sku_base["ingreso_medio"] < 60000), "sku_tier"] = "Mid-Value"
+    df_sku_base.loc[(df_sku_base["ingreso_medio"] >= 60000) & (df_sku_base["ingreso_medio"] < 80000) & (df_sku_base["pct_mexicana"] >= 10), "sku_tier"] = "Mid-Market"
+    df_sku_base.loc[(df_sku_base["ingreso_medio"] >= 80000) & (df_sku_base["pct_mexicana"] >= 15), "sku_tier"] = "Premium"
+    
+    # Si hay columna cluster de K-Means, usarla; si no, crear ficticios
+    if "cluster" not in df_sku_base.columns or df_sku_base["cluster"].isna().all():
+        st.info("ℹ️ Run el modelo K-Means primero to see Cluster × SKU analysis. Showing analysis by SKU Tier only.")
+        has_clusters = False
+    else:
+        has_clusters = True
+        df_sku_base["cluster"] = df_sku_base["cluster"].fillna(-1).astype(int)
+    
+    # ============ 0. CATÁLOGO DE SKUs POR TIER ============
+    st.markdown("---")
+    st.markdown("### 📦 0. SKU Catalog by Segment")
+    
+    sku_catalog = {
+        "Premium": [
+            {"name": "Organic Premium Hass Avocado", "size": "3 pack", "price": "$9.99", "format": "Premium box", "features": "USDA Organic, Pesticide-free, Direct import"},
+            {"name": "Artisanal Oaxaca Cheese", "size": "16oz", "price": "$11.99", "format": "Premium bag", "features": "Fresh cheese, Traditional craftsmanship, Fair trade"},
+            {"name": "Organic Poblano Peppers", "size": "2 lb", "price": "$12.99", "format": "Premium bag", "features": "Fresh harvest, Chemical-free, Small producers"}
+        ],
+        "Mid-Market": [
+            {"name": "100% Nixtamalized Corn Tortillas", "size": "24 pack", "price": "$6.99", "format": "Family pack", "features": "Traditional recipe, Fresh, Preservative-free"},
+            {"name": "Premium Black Beans", "size": "16oz", "price": "$7.49", "format": "Family bag", "features": "Ready-cooked, Consistent quality, Delicious"},
+            {"name": "Homemade Red Salsa", "size": "15oz", "price": "$5.99", "format": "4-pack", "features": "Homemade recipe, Fresh tomatoes, Popular"}
+        ],
+        "Mid-Value": [
+            {"name": "Long Grain White Rice", "size": "2 lb", "price": "$4.49", "format": "Bulk bag", "features": "Quality rice, Large volume, Affordable"},
+            {"name": "Assorted Dried Peppers", "size": "8oz", "price": "$3.99", "format": "Large bag", "features": "Guajillo/ancho mix, Maximum value, Culinary use"},
+            {"name": "Homemade Chicken Broth", "size": "14oz", "price": "$3.49", "format": "4-pack bundle", "features": "Concentrated broth, Daily use, Competitive price"}
+        ],
+        "Value": [
+            {"name": "Store Brand Refried Beans", "size": "16oz", "price": "$2.99", "format": "Bulk 10-pack", "features": "Ready to eat, Best market price, Large volume"},
+            {"name": "White Flour Tortillas", "size": "30 pack", "price": "$2.49", "format": "Family multipack", "features": "Large tortillas, Budget-friendly, Large size"},
+            {"name": "Budget Green Salsa", "size": "16oz", "price": "$1.99", "format": "12x Multipack", "features": "Basic salsa, Minimum price, Maximum quantity"}
+        ]
+    }
+    
+    col_prem, col_mid, col_val, col_econ = st.columns(4)
+    
+    with col_prem:
+        st.subheader("🟡 Premium")
+        for sku in sku_catalog["Premium"]:
+            st.write(f"**{sku['name']}**")
+            st.caption(f"{sku['size']} | {sku['price']} | {sku['format']}\n{sku['features']}")
+            st.divider()
+    
+    with col_mid:
+        st.subheader("🟢 Mid-Market")
+        for sku in sku_catalog["Mid-Market"]:
+            st.write(f"**{sku['name']}**")
+            st.caption(f"{sku['size']} | {sku['price']} | {sku['format']}\n{sku['features']}")
+            st.divider()
+    
+    with col_val:
+        st.subheader("🔵 Mid-Value")
+        for sku in sku_catalog["Mid-Value"]:
+            st.write(f"**{sku['name']}**")
+            st.caption(f"{sku['size']} | {sku['price']} | {sku['format']}\n{sku['features']}")
+            st.divider()
+    
+    with col_econ:
+        st.subheader("🟣 Value")
+        for sku in sku_catalog["Value"]:
+            st.write(f"**{sku['name']}**")
+            st.caption(f"{sku['size']} | {sku['price']} | {sku['format']}\n{sku['features']}")
+            st.divider()
+    
+    # ============ 1. HEATMAP CLUSTER × SKU ============
+    if has_clusters:
+        st.markdown("---")
+        st.markdown("### 🔥 1. Cluster × SKU Tier Matrix (Heatmap)")
+        
+        matriz_cluster_sku = pd.crosstab(
+            df_sku_base["cluster"],
+            df_sku_base["sku_tier"],
+            margins=False
+        )
+        
+        fig, ax = plt.subplots(figsize=(10, 6))
+        im = ax.imshow(matriz_cluster_sku.values, cmap="YlOrRd", aspect="auto")
+        ax.set_xticks(range(len(matriz_cluster_sku.columns)))
+        ax.set_yticks(range(len(matriz_cluster_sku.index)))
+        ax.set_xticklabels(matriz_cluster_sku.columns, rotation=45)
+        ax.set_yticklabels([f"Cluster {int(i)}" for i in matriz_cluster_sku.index])
+        ax.set_ylabel("Cluster K-Means")
+        ax.set_xlabel("SKU Tier")
+        ax.set_title("Distribution of ZIP codes: Cluster × SKU Tier")
+        
+        # Añadir valores en celdas
+        for i in range(len(matriz_cluster_sku.index)):
+            for j in range(len(matriz_cluster_sku.columns)):
+                val = matriz_cluster_sku.values[i, j]
+                text = ax.text(j, i, f"{int(val)}", ha="center", va="center", color="black", fontweight="bold")
+        
+        plt.colorbar(im, ax=ax, label="# ZIP codes")
+        plt.tight_layout()
+        st.pyplot(fig)
+        
+        st.dataframe(matriz_cluster_sku, use_container_width=True)
+    
+    # ============ 2. RECOMENDACIONES POR CLUSTER ============
+    if has_clusters:
+        st.markdown("---")
+        st.markdown("### 🎯 2. SKU Recommendation by K-Means Cluster")
+        
+        cluster_analysis_data = []
+        
+        for cluster_id in sorted(df_sku_base["cluster"].unique()):
+            if cluster_id == -1:
+                continue
+            
+            cluster_data = df_sku_base[df_sku_base["cluster"] == cluster_id]
+            
+            # SKU dominante en este cluster
+            sku_dist = cluster_data["sku_tier"].value_counts()
+            dominant_sku = sku_dist.index[0]
+            dominant_pct = (sku_dist.iloc[0] / len(cluster_data) * 100)
+            
+            avg_income = cluster_data["ingreso_medio"].mean()
+            avg_pct_mex = cluster_data["pct_mexicana"].mean()
+            pop_mex = cluster_data["pop_mexicana"].sum()
+            n_zips = len(cluster_data)
+            
+            cluster_analysis_data.append({
+                "Cluster": cluster_id,
+                "SKU Primary": dominant_sku,
+                "% SKU": f"{dominant_pct:.0f}%",
+                "Income Prom": f"${avg_income:,.0f}",
+                "% Mexican": f"{avg_pct_mex:.1f}%",
+                "Mexican Pop": f"{pop_mex:,.0f}",
+                "# ZIPs": n_zips
+            })
+            
+            top_cities_cluster = cluster_data.groupby("PHYSICAL_CITY")["pop_mexicana"].sum().nlargest(3)
+            
+            with st.expander(f"**Cluster {int(cluster_id)}** - PRIMARY: {dominant_sku} ({dominant_pct:.0f}%)"):
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("Income Prom", f"${avg_income:,.0f}")
+                    st.metric("% Mexican", f"{avg_pct_mex:.1f}%")
+                with col2:
+                    st.metric("Mexican Pop", f"{pop_mex:,.0f}")
+                    st.metric("# ZIP codes", n_zips)
+                with col3:
+                    st.metric("SKU Primary", dominant_sku)
+                    st.metric("Dominance", f"{dominant_pct:.0f}%")
+                
+                st.markdown("**📍 Top 3 Cities:**")
+                for city, pop in top_cities_cluster.items():
+                    st.markdown(f"  - {city}: {pop:,.0f} mexicanos")
+                
+                st.markdown(f"\n**🎯 SKUs Recomendados para Cluster {int(cluster_id)}:**")
+                tier_skus = sku_catalog.get(dominant_sku, [])
+                for idx, sku in enumerate(tier_skus[:2], 1):
+                    st.markdown(f"""
+**{idx}. {sku['name']}**
+- Tamaño: {sku['size']} | Precio: {sku['price']}
+- Formato: {sku['format']}
+- Características: {sku['features']}
+                    """)
+                
+                st.markdown(f"**📊 Composición SKU en Cluster:**")
+                sku_mix = cluster_data["sku_tier"].value_counts()
+                for sku_tier, count in sku_mix.items():
+                    pct = count/len(cluster_data)*100
+                    st.markdown(f"  - **{sku_tier}**: {count} ZIPs ({pct:.0f}%)")
+        
+        st.markdown("---")
+        st.markdown("#### Summary by Cluster")
+        st.dataframe(pd.DataFrame(cluster_analysis_data), use_container_width=True)
+    
+    # ============ 3. TABLA COMPARATIVA: CLUSTER vs SKU PERFORMANCE ============
+    st.markdown("---")
+    st.markdown("### 📊 3. Comparative Table: Cluster × SKU Performance")
+    
+    if has_clusters:
+        performance_data = []
+        
+        for cluster_id in sorted(df_sku_base[df_sku_base["cluster"] != -1]["cluster"].unique()):
+            cluster_data = df_sku_base[df_sku_base["cluster"] == cluster_id]
+            
+            sku_dist = cluster_data["sku_tier"].value_counts()
+            dominant_sku = sku_dist.index[0]
+            
+            avg_income = cluster_data["ingreso_medio"].mean()
+            avg_pct_mex = cluster_data["pct_mexicana"].mean()
+            pop_mex = cluster_data["pop_mexicana"].sum()
+            
+            # Penetración estimada basada en tier
+            pen_map = {"Premium": 10, "Mid-Market": 15, "Mid-Value": 18, "Value": 20}
+            penetration = pen_map.get(dominant_sku, 15)
+            
+            # ROI rough estimate
+            roi_map = {"Premium": 45, "Mid-Market": 40, "Mid-Value": 50, "Value": 60}
+            roi = roi_map.get(dominant_sku, 40)
+            
+            # Risk level
+            risk_map = {"Premium": "Low", "Mid-Market": "Low", "Mid-Value": "Medium", "Value": "High"}
+            risk = risk_map.get(dominant_sku, "Medium")
+            
+            # Priority (Premium first, then volume)
+            priority_map = {"Premium": 1, "Mid-Market": 2, "Mid-Value": 2.5, "Value": 3}
+            priority = priority_map.get(dominant_sku, 2)
+            
+            performance_data.append({
+                "Cluster": f"C{int(cluster_id)}",
+                "SKU Primary": dominant_sku,
+                "# ZIPs": len(cluster_data),
+                "Mexican Pop": f"{pop_mex:,.0f}",
+                "Income Prom": f"${avg_income:,.0f}",
+                "% Mexican": f"{avg_pct_mex:.1f}%",
+                "Est. Penetration Y1": f"{penetration}%",
+                "Est. ROI": f"{roi}%",
+                "Risk": risk,
+                "Priority": priority
+            })
+        
+        perf_df = pd.DataFrame(performance_data).sort_values("Priority")
+        st.dataframe(perf_df, use_container_width=True)
+        
+        st.markdown("**Legend:** Priority 1=Immediate Launch | Priority 2=Q2-Q3 | Priority 3=Q3-Q4")
+        
+        # ============ 4. TABLA DE RECOMENDACIÓN DE SKUs ESPECÍFICOS POR CLUSTER ============
+        st.markdown("---")
+        st.markdown("### 🛒 4. Specific SKU Recommendation by Cluster")
+        
+        sku_rec_data = []
+        for cluster_id in sorted(df_sku_base[df_sku_base["cluster"] != -1]["cluster"].unique()):
+            cluster_data = df_sku_base[df_sku_base["cluster"] == cluster_id]
+            sku_dist = cluster_data["sku_tier"].value_counts()
+            dominant_sku = sku_dist.index[0]
+            
+            tier_skus = sku_catalog.get(dominant_sku, [])
+            if tier_skus:
+                primary_sku = tier_skus[0]["name"]
+                secondary_sku = tier_skus[1]["name"] if len(tier_skus) > 1 else tier_skus[0]["name"]
+                primary_price = tier_skus[0]["price"]
+            else:
+                primary_sku = "N/A"
+                secondary_sku = "N/A"
+                primary_price = "N/A"
+            
+            sku_rec_data.append({
+                "Cluster": f"C{int(cluster_id)}",
+                "Tier": dominant_sku,
+                "Primary SKU (Launch)": primary_sku,
+                "Precio": primary_price,
+                "Secondary SKU (Q2)": secondary_sku,
+                "Target Market": "Incomes ${:,.0f}+, {} mexicanos".format(
+                    int(cluster_data["ingreso_medio"].mean()),
+                    "{:.0f}%".format(cluster_data["pct_mexicana"].mean())
+                )
+            })
+        
+        sku_rec_df = pd.DataFrame(sku_rec_data)
+        st.dataframe(sku_rec_df, use_container_width=True)
+        
+        st.markdown("""
+**Launch Strategy by Cluster:**
+- **SKU Primario**: Lanzar primero en Q1 (Lanzamiento Inmediato)
+- **SKU Secundario**: Lanzar en Q2 as line extension
+- Adapt formats and sizes according to availability in retailers by ZIP code
+        """)
+    else:
+        st.info("Run K-Means primero para ver tabla comparativa Cluster × SKU")
 
 
